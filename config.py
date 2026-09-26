@@ -32,6 +32,18 @@ PROJECTS_URL = 'https://kwork.ru/projects?a=1&page={page}'
 OFFER_URL = 'https://kwork.ru/new_offer?project={project_id}'
 PROJECT_URL = 'https://kwork.ru/projects/{project_id}/view'
 
+# --- OpenRouter (AI-отклики) ---
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
+OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'google/gemma-4-31b-it:free')
+# Запасные модели через запятую: используются, если основная недоступна (OpenRouter берёт максимум 3 модели)
+OPENROUTER_FALLBACK_MODELS = [
+    m.strip() for m in os.getenv('OPENROUTER_FALLBACK_MODELS', 'qwen/qwen3.8-27b:free,openrouter/free').split(',')
+    if m.strip()
+]
+OPENROUTER_TIMEOUT = _float('OPENROUTER_TIMEOUT', 60)
+# Кратко о себе (навыки, опыт) — модель опирается только на эти факты
+FREELANCER_PROFILE = os.getenv('FREELANCER_PROFILE', '').replace('\\n', '\n')
+
 # --- Selenium ---
 # Постоянный профиль Chrome: в нём хранятся cookies авторизованной сессии.
 CHROME_PROFILE_DIR = os.getenv('CHROME_PROFILE_DIR', str(BASE_DIR / 'chrome_profile'))

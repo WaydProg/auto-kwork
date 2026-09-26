@@ -24,9 +24,15 @@ async def init_db() -> None:
                 status      TEXT NOT NULL DEFAULT 'new'
                             CHECK (status IN ('new', 'sent', 'ignored', 'responded')),
                 message_ids TEXT,
+                draft       TEXT,
                 created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Миграция баз, созданных до появления AI-черновиков
+        async with db.execute('PRAGMA table_info(projects)') as cur:
+            columns = {row[1] async for row in cur}
+        if 'draft' not in columns:
+            await db.execute('ALTER TABLE projects ADD COLUMN draft TEXT')
         await db.commit()
 
 
@@ -86,4 +92,11 @@ async def mark_sent(project_id: int, message_ids: list[int]) -> None:
             'UPDATE projects SET status = ?, message_ids = ? WHERE id = ?',
             (STATUS_SENT, json.dumps(message_ids), project_id),
         )
+        await db.commit()
+
+
+async def set_draft(project_id: int, draft: str | None) -> None:
+    """Черновик отклика (AI-генерация или правка пользователя) до подтверждения отправки."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('UPDATE projects SET draft = ? WHERE id = ?', (draft, project_id))
         await db.commit()

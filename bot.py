@@ -7,6 +7,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 
 import database as db
+from ai_service import AIService
 from config import BOT_TOKEN
 from handlers import router
 from parser import Monitor
@@ -16,7 +17,9 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     monitor = Monitor(bot)
-    dp['monitor'] = monitor  # попадает в хендлеры как аргумент `monitor`
+    ai = AIService()
+    dp['monitor'] = monitor  # попадают в хендлеры как аргументы `monitor` и `ai`
+    dp['ai'] = ai
     dp.include_router(router)
 
     await db.init_db()
@@ -30,6 +33,7 @@ async def main():
         await dp.start_polling(bot)
     finally:
         await monitor.shutdown()
+        await ai.aclose()
         await bot.session.close()
 
 

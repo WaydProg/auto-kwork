@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Telegram bot (aiogram 3, Python 3.14) that monitors new projects on kwork.ru with Selenium (undetected-chromedriver), notifies admins in Telegram with inline buttons (open / respond / ignore), and submits responses ("отклики") through the browser. Code comments, bot messages and README are in Russian. See README.md for setup, `.env` options and anti-blocking notes.
+Telegram bot (aiogram 3, Python 3.14) that monitors new projects on kwork.ru with Selenium (undetected-chromedriver), notifies admins in Telegram with inline buttons (open / manual respond / AI respond / ignore), generates response drafts via OpenRouter (`ai_service.py`), and submits responses ("отклики") through the browser. Code comments, bot messages and README are in Russian. See README.md for setup, `.env` options and anti-blocking notes.
 
 ## Commands
 
@@ -26,7 +26,9 @@ Useful env overrides for local experiments: `HEADLESS=1`, `CHROME_PROFILE_DIR=<t
 - **Threading model:** all Selenium calls go through `Monitor.run_in_browser`, which runs them on a single-worker `ThreadPoolExecutor`. This serializes the parse loop and response submission on one driver. Never call `KworkBrowser` methods directly from async code.
 - **Lifecycle:** `Monitor.start/stop` manage one `asyncio.Task` guarded by an `asyncio.Lock`. `stop()` cancels the task and then queues `browser.close` on the executor, so the close runs after any in-flight Selenium call. The driver is created lazily, so `send_offer` works even when monitoring is stopped (handlers close the browser afterwards in that case).
 - **Dedup/status flow (`database.py`, raw aiosqlite):** a project is inserted as `new` before notifying, and `mark_sent` sets `sent` and stores Telegram `message_ids` (used by the ignore handler to delete file and text messages). Anything not `new` is skipped. Pagination stops at the first page with no fresh projects.
-- **DI:** `bot.py` puts the `Monitor` in `dp['monitor']`, and aiogram injects it into handlers as the `monitor` argument. The router is restricted to `config.LIST_ADMINS_ID`.
+- **DI:** `bot.py` puts `Monitor` and `AIService` in `dp['monitor']` / `dp['ai']`, and aiogram injects them into handlers by argument name. The router is restricted to `config.LIST_ADMINS_ID`.
+- **AI responses:** `ai_service.AIService` (httpx) calls OpenRouter with a `models` fallback list and retries 429/5xx and error-in-200 bodies. `AIServiceError` messages are user-facing (Russian). Callbacks: `ai_respond_`, `regenerate_ai_`, `confirm_ai_`, `edit_ai_` (FSM `RespondState.editing_ai_draft`), `cancel_ai_`. The current draft lives in the `projects.draft` column, not FSM data, so it survives restarts and `state.clear()`. `init_db` adds the column to older databases via `PRAGMA table_info`.
+- **Submitting:** both the manual and AI paths go through `handlers._submit_offer`, which parses the `Цена:`/`Срок:` override lines, guards double submits with `_submitting`, sets `responded` and replaces the project card keyboard.
 - **Response FSM:** `respond_{id}` callback → `RespondState.waiting_text` → `KworkBrowser.send_offer`. Optional `Цена: N` / `Срок: N` lines in the text override price and days (`handlers._extract_overrides`).
 
 ## Gotchas
