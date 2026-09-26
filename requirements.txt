@@ -1,0 +1,7 @@
+# Python 3.14
+aiogram==3.31.0            # Telegram Bot API (aiohttp входит в зависимости)
+aiosqlite==0.22.1          # асинхронный SQLite
+selenium==4.49.0           # управление браузером
+undetected-chromedriver==3.5.5  # патченный chromedriver, меньше детекта автоматизации
+setuptools>=70             # undetected-chromedriver использует distutils, удалённый из Python 3.12+
+python-dotenv==1.2.3       # загрузка .env
