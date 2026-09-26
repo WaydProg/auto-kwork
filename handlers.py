@@ -1,5 +1,6 @@
 import html
 import logging
+import re
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction
@@ -11,8 +12,9 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardBut
 import config
 import database as db
 from ai_service import AIService, AIServiceError
-from keyboards import ai_preview_kb, cancel_kb
-from offer import OfferError, parse_offer
+from keyboards import ai_preview_kb, cancel_kb, days_kb, price_kb
+from offer import (PAYMENT_STAGES, OfferError, default_price, duration_label, max_price, param_lines, parse_offer,
+                   set_param)
 from parser import Monitor, ParserError
 from states import RespondState
 
@@ -129,7 +131,7 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext):
 
 @router.message(Command('cancel'), StateFilter('*'))
 async def cmd_cancel(message: Message, state: FSMContext, bot: Bot):
-    if await state.get_state() == RespondState.editing_ai_draft:
+    if await state.get_state() in (RespondState.editing_ai_draft, RespondState.editing_price):
         # Правка отменена — возвращаем кнопки прежнему предпросмотру
         data = await state.get_data()
         try:
@@ -137,6 +139,7 @@ async def cmd_cancel(message: Message, state: FSMContext, bot: Bot):
                                                 reply_markup=ai_preview_kb(data['project_id']))
         except TelegramBadRequest:
             pass
+        await _delete_prompt(bot, message.chat.id, data)
     await state.clear()
     await message.answer('Отменено.')
 
@@ -230,8 +233,8 @@ def _preview_text(project: dict, draft: str, note: str = '') -> str:
     return f'{header}<code>{body}</code>\n\n{params}{footer}'
 
 
-async def _get_active_project(callback: CallbackQuery, prefix: str) -> dict | None:
-    project = await db.get_project(int(callback.data.removeprefix(prefix)))
+async def _get_active_project(callback: CallbackQuery, project_id: int) -> dict | None:
+    project = await db.get_project(project_id)
     if project is None:
         await callback.answer('Проект не найден в базе', show_alert=True)
         return None
@@ -253,6 +256,9 @@ async def _generate_into(msg: Message, project: dict, ai: AIService, bot: Bot, r
                 text='🔄 Попробовать снова', callback_data=f'regenerate_ai_{project["id"]}')]]),
         )
         return
+    # Цена, срок и прочие параметры, выставленные для прошлого варианта, сохраняются
+    if params := param_lines(project.get('draft') or ''):
+        draft = draft.rstrip() + '\n\n' + '\n'.join(params)
     await db.set_draft(project['id'], draft)
     await msg.edit_text(_preview_text(project, draft), reply_markup=ai_preview_kb(project['id']),
                         disable_web_page_preview=True)
@@ -260,7 +266,7 @@ async def _generate_into(msg: Message, project: dict, ai: AIService, bot: Bot, r
 
 @router.callback_query(F.data.startswith('ai_respond_'))
 async def cb_ai_respond(callback: CallbackQuery, ai: AIService, bot: Bot):
-    project = await _get_active_project(callback, 'ai_respond_')
+    project = await _get_active_project(callback, int(callback.data.removeprefix('ai_respond_')))
     if project is None:
         return
     await callback.answer('Генерирую отклик…')
@@ -272,7 +278,7 @@ async def cb_ai_respond(callback: CallbackQuery, ai: AIService, bot: Bot):
 
 @router.callback_query(F.data.startswith('regenerate_ai_'))
 async def cb_ai_regenerate(callback: CallbackQuery, ai: AIService, bot: Bot):
-    project = await _get_active_project(callback, 'regenerate_ai_')
+    project = await _get_active_project(callback, int(callback.data.removeprefix('regenerate_ai_')))
     if project is None:
         return
     await callback.answer('Генерирую новый вариант…')
@@ -282,7 +288,7 @@ async def cb_ai_regenerate(callback: CallbackQuery, ai: AIService, bot: Bot):
 
 @router.callback_query(F.data.startswith('confirm_ai_'))
 async def cb_ai_confirm(callback: CallbackQuery, state: FSMContext, monitor: Monitor, bot: Bot):
-    project = await _get_active_project(callback, 'confirm_ai_')
+    project = await _get_active_project(callback, int(callback.data.removeprefix('confirm_ai_')))
     if project is None:
         return
     if not project.get('draft'):
@@ -303,7 +309,7 @@ async def cb_ai_confirm(callback: CallbackQuery, state: FSMContext, monitor: Mon
 
 @router.callback_query(F.data.startswith('edit_ai_'))
 async def cb_ai_edit(callback: CallbackQuery, state: FSMContext):
-    project = await _get_active_project(callback, 'edit_ai_')
+    project = await _get_active_project(callback, int(callback.data.removeprefix('edit_ai_')))
     if project is None:
         return
     await state.set_state(RespondState.editing_ai_draft)
@@ -353,6 +359,145 @@ async def cb_ai_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# ---------- цена и срок черновика ----------
+
+async def _get_draft_project(callback: CallbackQuery, project_id: int) -> dict | None:
+    project = await _get_active_project(callback, project_id)
+    if project is not None and not project.get('draft'):
+        await callback.answer('Черновик не найден — сгенерируйте отклик заново', show_alert=True)
+        return None
+    return project
+
+
+async def _delete_prompt(bot: Bot, chat_id: int, data: dict) -> None:
+    if prompt_id := data.get('prompt_message_id'):
+        try:
+            await bot.delete_message(chat_id, prompt_id)
+        except TelegramBadRequest:
+            pass
+
+
+async def _apply_param(bot: Bot, chat_id: int, preview_message_id: int, project_id: int,
+                       name: str, value: int) -> None:
+    """Записывает «Цена: N» / «Срок: N» в черновик и обновляет предпросмотр на месте."""
+    project = await db.get_project(project_id)
+    draft = set_param(project['draft'], name, value)
+    await db.set_draft(project_id, draft)
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=preview_message_id, text=_preview_text(project, draft, note='Отклик'),
+            reply_markup=ai_preview_kb(project_id), disable_web_page_preview=True,
+        )
+    except TelegramBadRequest as e:
+        if 'not modified' not in str(e):
+            raise
+
+
+def _price_suggestions(project: dict) -> list[int]:
+    budget, limit = default_price(project), max_price(project)
+    if not budget:
+        return []
+    candidates = {budget, limit or budget}
+    if limit and limit > budget:
+        candidates.add(round((budget + limit) / 2 / 500) * 500 or budget)
+    return sorted(p for p in candidates if p > 0)
+
+
+@router.callback_query(F.data.startswith('price_ai_'))
+async def cb_ai_price(callback: CallbackQuery, state: FSMContext):
+    project_id = int(callback.data.removeprefix('price_ai_'))
+    project = await _get_draft_project(callback, project_id)
+    if project is None:
+        return
+    offer = parse_offer(project['draft'], project, validate=False)
+    if offer.payment == PAYMENT_STAGES:
+        await callback.answer('При оплате частями цена — это сумма задач. Измените суммы в строках '
+                              '«Задача: …» через ✏️ Изменить отклик.', show_alert=True)
+        return
+
+    await callback.message.edit_reply_markup(reply_markup=price_kb(project_id, _price_suggestions(project)))
+    limit = max_price(project)
+    prompt = await callback.message.answer(
+        f'💰 Сейчас: <b>{f"{offer.price:,}".replace(",", " ") if offer.price else "—"} ₽</b>. '
+        'Нажмите вариант под черновиком или отправьте цену числом'
+        + (f' (допустимо до {limit:,} ₽)'.replace(',', ' ') if limit else '') + '. /cancel — отмена.'
+    )
+    await state.set_state(RespondState.editing_price)
+    await state.update_data(project_id=project_id, preview_message_id=callback.message.message_id,
+                            prompt_message_id=prompt.message_id)
+    await callback.answer()
+
+
+@router.message(RespondState.editing_price, F.text)
+async def price_text(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    project = await db.get_project(data['project_id'])
+    raw = re.sub(r'[\s₽]|руб\.?|р\.?$', '', message.text.strip().lower())
+    if not raw.isdigit() or int(raw) <= 0:
+        await message.answer('Нужна цена целым числом, например <code>5000</code>. Или /cancel.')
+        return
+    price, limit = int(raw), max_price(project)
+    if limit and price > limit:
+        await message.answer(f'Kwork не примет больше {limit:,} ₽ для этого проекта. Введите другую цену.'.replace(',', ' '))
+        return
+
+    await state.clear()
+    await _apply_param(bot, message.chat.id, data['preview_message_id'], project['id'], 'Цена', price)
+    await _delete_prompt(bot, message.chat.id, data)
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data.startswith('setprice_ai_'))
+async def cb_ai_setprice(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    project_id, price = map(int, callback.data.removeprefix('setprice_ai_').split('_'))
+    if await _get_draft_project(callback, project_id) is None:
+        return
+    data = await state.get_data()
+    await state.clear()
+    await _apply_param(bot, callback.message.chat.id, callback.message.message_id, project_id, 'Цена', price)
+    await _delete_prompt(bot, callback.message.chat.id, data)
+    await callback.answer(f'Цена: {price:,} ₽'.replace(',', ' '))
+
+
+@router.callback_query(F.data.startswith('days_ai_'))
+async def cb_ai_days(callback: CallbackQuery):
+    project_id = int(callback.data.removeprefix('days_ai_'))
+    project = await _get_draft_project(callback, project_id)
+    if project is None:
+        return
+    current = parse_offer(project['draft'], project, validate=False).days
+    await callback.message.edit_reply_markup(reply_markup=days_kb(project_id, current))
+    await callback.answer('Выберите срок выполнения')
+
+
+@router.callback_query(F.data.startswith('setdays_ai_'))
+async def cb_ai_setdays(callback: CallbackQuery, bot: Bot):
+    project_id, days = map(int, callback.data.removeprefix('setdays_ai_').split('_'))
+    if await _get_draft_project(callback, project_id) is None:
+        return
+    await _apply_param(bot, callback.message.chat.id, callback.message.message_id, project_id, 'Срок', days)
+    await callback.answer(f'Срок: {duration_label(days)}')
+
+
+@router.callback_query(F.data.startswith('back_ai_'))
+async def cb_ai_back(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    if await state.get_state() == RespondState.editing_price:
+        await state.clear()
+        await _delete_prompt(bot, callback.message.chat.id, data)
+    await callback.message.edit_reply_markup(
+        reply_markup=ai_preview_kb(int(callback.data.removeprefix('back_ai_'))))
+    await callback.answer()
+
+
 @router.message(StateFilter(RespondState.waiting_text, RespondState.editing_ai_draft))
 async def respond_not_text(message: Message):
     await message.answer('Нужен текст отклика. Или /cancel.')
+
+
+@router.message(RespondState.editing_price)
+async def price_not_text(message: Message):
+    await message.answer('Нужна цена числом, например <code>5000</code>. Или /cancel.')

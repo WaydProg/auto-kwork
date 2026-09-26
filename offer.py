@@ -22,6 +22,16 @@ _PAYMENT_RE = re.compile(r'\s*оплата\s*:\s*(.+?)\s*', re.I)
 _STAGE_RE = re.compile(rf'\s*задача\s*:\s*(.+?)\s*[—–\-|:]\s*{_NUM}\s*', re.I)
 
 
+# Варианты срока в форме Kwork: (дней, подпись)
+DURATION_OPTIONS = [
+    (1, '1 день'), (2, '2 дня'), (3, '3 дня'), (4, '4 дня'), (5, '5 дней'), (6, '6 дней'),
+    (7, '7 дней'), (10, '10 дней'), (14, '2 недели'), (21, '3 недели'), (30, '1 месяц'), (60, '2 месяца'),
+]
+
+_PARAM_RES = {'Цена': _PRICE_RE, 'Срок': _DAYS_RE}
+_ALL_PARAM_RES = (_PRICE_RE, _DAYS_RE, _TITLE_RE, _PAYMENT_RE, _STAGE_RE)
+
+
 class OfferError(ValueError):
     """Ошибка в параметрах отклика, текст понятен пользователю."""
 
@@ -37,7 +47,7 @@ class Offer:
 
     def summary_html(self) -> str:
         price = f'{self.price:,} ₽'.replace(',', ' ') if self.price else 'из проекта'
-        lines = [f'💰 Цена: <b>{price}</b> · ⏱ Срок: <b>{self.days} дн.</b>']
+        lines = [f'💰 Цена: <b>{price}</b> · ⏱ Срок: <b>{duration_label(self.days)}</b>']
         if self.payment == PAYMENT_STAGES:
             lines.append('💳 Оплата: <b>по мере выполнения задач</b>')
             lines += [f'   {i}. {html.escape(name)} — {p:,} ₽'.replace(',', ' ')
@@ -55,6 +65,34 @@ def _int(s: str) -> int:
 def default_price(project: dict) -> int | None:
     m = re.match(r'[\d\s]+', project.get('price') or '')
     return _int(m.group()) if m and m.group().strip() else None
+
+
+def max_price(project: dict) -> int | None:
+    """Допустимый максимум из строки цены проекта: «5 000 ₽ (допустимо до 15 000 ₽)»."""
+    m = re.search(r'допустимо до\s*([\d\s]+)', project.get('price') or '')
+    return _int(m.group(1)) if m else default_price(project)
+
+
+def duration_label(days: int) -> str:
+    """Подпись варианта Kwork, который будет выбран для days (ближайший не меньший)."""
+    return next((label for n, label in DURATION_OPTIONS if n >= days), DURATION_OPTIONS[-1][1])
+
+
+def set_param(draft: str, name: str, value: int) -> str:
+    """Заменяет (или добавляет в конец) строку «Цена: N» / «Срок: N» в черновике."""
+    regex = _PARAM_RES[name]
+    lines = [line for line in draft.splitlines() if not regex.fullmatch(line)]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    body = [line for line in lines if not any(r.fullmatch(line) for r in _ALL_PARAM_RES)]
+    params = [line for line in lines if any(r.fullmatch(line) for r in _ALL_PARAM_RES)]
+    # Параметры держим отдельным блоком после текста
+    return '\n'.join(body).rstrip() + '\n\n' + '\n'.join([*params, f'{name}: {value}'])
+
+
+def param_lines(draft: str) -> list[str]:
+    """Служебные строки черновика — чтобы сохранить их при перегенерации текста."""
+    return [line.strip() for line in draft.splitlines() if any(r.fullmatch(line) for r in _ALL_PARAM_RES)]
 
 
 def strip_params(raw_text: str) -> str:
