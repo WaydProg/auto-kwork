@@ -60,6 +60,8 @@ PAGE_LOAD_TIMEOUT = _float('PAGE_LOAD_TIMEOUT', 30)
 MAX_PAGES = _int('MAX_PAGES', 3)                         # сколько страниц листать за цикл
 SEND_DELAY = _float('SEND_DELAY', 1.0)                   # пауза между сообщениями в Telegram
 OFFER_DEFAULT_DAYS = _int('OFFER_DEFAULT_DAYS', 3)            # срок в отклике по умолчанию
+# Порядок оплаты по умолчанию: full — целиком, stages — по мере выполнения задач
+OFFER_PAYMENT_TYPE = os.getenv('OFFER_PAYMENT_TYPE', 'full').strip().lower()
 
 # --- Файлы ---
 MAX_FILE_SIZE = 50 * 1024 * 1024  # лимит Bot API на отправку файла

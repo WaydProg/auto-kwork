@@ -6,6 +6,7 @@
 """
 import asyncio
 import html
+import http.client
 import json
 import logging
 import random
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -29,6 +31,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 import config
 import database as db
 from keyboards import project_kb
+from offer import PAYMENT_STAGES, Offer
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,37 @@ el.dispatchEvent(new Event('input', {bubbles: true}));
 el.dispatchEvent(new Event('change', {bubbles: true}));
 el.dispatchEvent(new Event('blur', {bubbles: true}));
 '''
+
+
+# Редактор trumbowyg (описание, название заказа, задачи): Vue читает содержимое видимого
+# contenteditable-блока, поэтому пишем и в него, и в скрытую textarea.
+_SET_TRUMBOWYG_JS = '''
+const ta = arguments[0], v = arguments[1];
+const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const value = v.split('\\n').map(l => '<div>' + (esc(l) || '<br>') + '</div>').join('');
+const ed = ta.closest('.trumbowyg-box')?.querySelector('.trumbowyg-editor');
+if (ed) {
+    ed.innerHTML = value;
+    ed.dispatchEvent(new Event('input', {bubbles: true}));
+    ed.dispatchEvent(new Event('keyup', {bubbles: true}));
+}
+ta.value = value;
+ta.dispatchEvent(new Event('input', {bubbles: true}));
+ta.dispatchEvent(new Event('change', {bubbles: true}));
+'''
+
+
+def _duration_days(label: str) -> int | None:
+    """«3 дня» → 3, «2 недели» → 14, «1 месяц» → 30."""
+    m = re.match(r'\s*(\d+)\s*(\w+)', label or '')
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2).lower()
+    if unit.startswith('нед'):
+        return n * 7
+    if unit.startswith('мес'):
+        return n * 30
+    return n
 
 
 class ParserError(Exception):
@@ -135,17 +169,26 @@ class KworkBrowser:
                 self.close()
 
         Path(config.CHROME_PROFILE_DIR).mkdir(parents=True, exist_ok=True)
-        options = uc.ChromeOptions()
-        options.add_argument('--lang=ru-RU')
-        options.add_argument('--window-size=1400,1000')
-        options.add_argument('--no-first-run')
-        options.add_argument('--no-default-browser-check')
-        self.driver = uc.Chrome(
-            options=options,
-            user_data_dir=config.CHROME_PROFILE_DIR,
-            headless=self.headless,
-            version_main=_detect_chrome_major(),
-        )
+        for attempt in range(3):
+            options = uc.ChromeOptions()  # uc не разрешает переиспользовать объект опций
+            options.add_argument('--lang=ru-RU')
+            options.add_argument('--window-size=1400,1000')
+            options.add_argument('--no-first-run')
+            options.add_argument('--no-default-browser-check')
+            try:
+                self.driver = uc.Chrome(
+                    options=options,
+                    user_data_dir=config.CHROME_PROFILE_DIR,
+                    headless=self.headless,
+                    version_main=_detect_chrome_major(),
+                )
+                break
+            except (OSError, http.client.HTTPException, urllib.error.URLError) as e:
+                # uc при старте скачивает chromedriver — сетевые сбои тут бывают разовыми
+                if attempt == 2:
+                    raise
+                logger.warning('Не удалось запустить chromedriver (%s), повтор...', e)
+                time.sleep(3)
         self.driver.set_page_load_timeout(config.PAGE_LOAD_TIMEOUT)
         return self.driver
 
@@ -262,8 +305,78 @@ class KworkBrowser:
     def _visible(self, selector: str) -> list[WebElement]:
         return [e for e in self.driver.find_elements(By.CSS_SELECTOR, selector) if e.is_displayed()]
 
-    def send_offer(self, project_id: int, text: str, price: int | None, days: int | None) -> str:
-        """Отправляет отклик. Возвращает описание результата или бросает ParserError."""
+    def _wait_visible(self, selector: str, timeout: float = 10, root: WebElement | None = None) -> WebElement:
+        def find(_):
+            elements = (root or self.driver).find_elements(By.CSS_SELECTOR, selector)
+            return next((e for e in elements if e.is_displayed()), None)
+        try:
+            return WebDriverWait(self.driver, timeout).until(find)
+        except TimeoutException:
+            raise ParserError(f'На форме отклика не найден элемент {selector}')
+
+    def _pause(self) -> None:
+        time.sleep(random.uniform(0.4, 1.0))
+
+    def _type_number(self, inp: WebElement, value: int) -> None:
+        """Цены вводятся посимвольно: от этого поля зависят блоки, которые форма показывает дальше."""
+        self.driver.execute_script('arguments[0].scrollIntoView({block: "center"})', inp)
+        self.driver.execute_script(_SET_VALUE_JS, inp, '')
+        self.driver.execute_script('arguments[0].focus()', inp)
+        inp.send_keys(str(value))
+        self._pause()
+
+    def _set_editor(self, textarea: WebElement, value: str) -> None:
+        self.driver.execute_script('arguments[0].scrollIntoView({block: "center"})', textarea.find_element(
+            By.XPATH, './ancestor::div[contains(@class, "trumbowyg-box")][1]'))
+        self.driver.execute_script(_SET_TRUMBOWYG_JS, textarea, value)
+        self._pause()
+
+    def _select_duration(self, days: int) -> str:
+        """Выбирает в списке срока ближайший вариант, не меньший days. Возвращает подпись варианта."""
+        root = self._wait_visible('.v-select.duration-select')
+        self.driver.execute_script('arguments[0].scrollIntoView({block: "center"})', root)
+        root.find_element(By.CSS_SELECTOR, '.vs__dropdown-toggle').click()
+        WebDriverWait(self.driver, 5).until(lambda d: d.find_elements(By.CSS_SELECTOR, '.vs__dropdown-option'))
+        # .text пуст у пунктов вне видимой области меню, поэтому читаем textContent
+        options = [(o, _duration_days(o.get_attribute('textContent')))
+                   for o in self.driver.find_elements(By.CSS_SELECTOR, '.vs__dropdown-option')]
+        options = [(o, n) for o, n in options if n]
+        if not options:
+            raise ParserError('Не удалось прочитать варианты срока выполнения')
+        option, _ = min(((o, n) for o, n in options if n >= days), key=lambda x: x[1], default=max(options, key=lambda x: x[1]))
+        label = option.get_attribute('textContent').strip()
+        self.driver.execute_script('arguments[0].scrollIntoView({block: "nearest"})', option)
+        option.click()
+        self._pause()
+        return label
+
+    def _fill_stages(self, stages: list[tuple[str, int]]) -> None:
+        # Kwork показывает 3 пустые задачи; недостающие добавляем, лишние удаляем
+        for i, (name, price) in enumerate(stages):
+            rows = self.driver.find_elements(By.CSS_SELECTOR, '.stages__stage')
+            if i >= len(rows):
+                add = self._wait_visible('.stages__add-stage')
+                if 'disabled' in (add.get_attribute('class') or ''):
+                    raise ParserError(f'Kwork не даёт добавить задачу №{i + 1}: слишком много задач или не хватает суммы')
+                self.driver.execute_script('arguments[0].click()', add)
+                WebDriverWait(self.driver, 5).until(
+                    lambda d: len(d.find_elements(By.CSS_SELECTOR, '.stages__stage')) > i)
+                rows = self.driver.find_elements(By.CSS_SELECTOR, '.stages__stage')
+            row = rows[i]
+            self._set_editor(row.find_element(By.CSS_SELECTOR, 'textarea[name^="stageTitle"]'), name)
+            self._type_number(row.find_element(By.CSS_SELECTOR, '.stages__stage-price-input'), price)
+        for row in reversed(self.driver.find_elements(By.CSS_SELECTOR, '.stages__stage')[len(stages):]):
+            delete = row.find_elements(By.CSS_SELECTOR, '.stages__stage-controls-delete')
+            if delete:
+                self.driver.execute_script('arguments[0].click()', delete[0])
+                self._pause()
+
+    def _form_errors(self) -> list[str]:
+        return [e.text.strip() for e in self._visible('.form-item__error, [class*="error-text"], .kw-error')
+                if e.text.strip()]
+
+    def send_offer(self, project_id: int, offer: Offer, dry_run: bool = False) -> str:
+        """Заполняет и отправляет форму отклика. dry_run — заполнить, сделать скриншот и не отправлять."""
         if not self.login():
             raise ParserError('Нет авторизации на Kwork. Проверьте KWORK_EMAIL/KWORK_PASSWORD '
                               'или выполните `python parser.py --login`.')
@@ -271,49 +384,67 @@ class KworkBrowser:
         driver.get(config.OFFER_URL.format(project_id=project_id))
 
         try:
-            field = WebDriverWait(driver, 20).until(
-                lambda d: next(iter(
-                    self._visible('textarea[name="description"]')
-                    or self._visible('textarea')
-                    or self._visible('[contenteditable="true"]')
-                ), None)
-            )
+            # Сама textarea скрыта редактором trumbowyg, поэтому ждём присутствия, а не видимости
+            field = WebDriverWait(driver, 20).until(lambda d: next(iter(
+                d.find_elements(By.CSS_SELECTOR, 'textarea[name="description"]')), None))
         except TimeoutException:
             shot = self._screenshot(f'offer_{project_id}_no_form')
             raise ParserError(f'Форма отклика не найдена (url={driver.current_url}, скриншот: {shot}). '
                               'Возможно, отклик уже отправлен или закончились коннекты.')
 
-        driver.execute_script('arguments[0].scrollIntoView({block: "center"})', field)
-        driver.execute_script(_SET_VALUE_JS, field, text)
-        time.sleep(random.uniform(0.5, 1.2))
+        try:
+            # 1. Описание
+            self._set_editor(field, offer.text)
 
-        # Цена и срок: заполняем только если поля есть и пустые
-        if price:
-            for inp in self._visible('input[name*="price"], input[name*="cost"]'):
-                if not inp.get_attribute('value'):
-                    driver.execute_script(_SET_VALUE_JS, inp, str(price))
-        if days:
-            for inp in self._visible('input[name*="duration"], input[name*="days"]'):
-                if not inp.get_attribute('value'):
-                    driver.execute_script(_SET_VALUE_JS, inp, str(days))
-            for sel in driver.find_elements(By.CSS_SELECTOR, 'select[name*="duration"], select[name*="days"]'):
-                driver.execute_script(
-                    'const s = arguments[0], d = String(arguments[1]);'
-                    'const o = [...s.options].find(o => o.value === d) || [...s.options].find(o => o.value);'
-                    'if (o) { s.value = o.value; s.dispatchEvent(new Event("change", {bubbles: true})); }',
-                    sel, days,
-                )
-        time.sleep(random.uniform(0.5, 1.2))
+            # 2. Цена — после неё появляется выбор порядка оплаты
+            price_input = self._wait_visible('#offer-custom-price')
+            if m := re.fullmatch(r'\s*([\d\s]+)\s*-\s*([\d\s]+)\s*', price_input.get_attribute('placeholder') or ''):
+                low, high = (int(re.sub(r'\s', '', g)) for g in m.groups())
+                if not low <= offer.price <= high:
+                    raise ParserError(f'Цена {offer.price} ₽ вне допустимого диапазона {low}–{high} ₽')
+            self._type_number(price_input, offer.price)
 
-        buttons = [
-            b for b in self._visible('button, input[type="submit"]')
-            if b.is_enabled() and re.search(r'предложить|отправить|откликнуться',
-                                            (b.text or b.get_attribute('value') or ''), re.I)
-        ]
+            # 3. Порядок оплаты
+            self._wait_visible('.offer-payment-type__item')
+            items = driver.find_elements(By.CSS_SELECTOR, '.offer-payment-type__item')
+            item = items[1 if offer.payment == PAYMENT_STAGES else 0]
+            driver.execute_script('arguments[0].scrollIntoView({block: "center"})', item)
+            item.click()
+            WebDriverWait(driver, 5).until(lambda d: 'active' in (item.get_attribute('class') or ''))
+            self._pause()
+
+            # 4. Название заказа (целиком) или задачи (по частям)
+            if offer.payment == PAYMENT_STAGES:
+                self._wait_visible('.stages__stage')
+                self._fill_stages(offer.stages)
+            else:
+                title = WebDriverWait(driver, 10).until(lambda d: next(iter(
+                    d.find_elements(By.CSS_SELECTOR, 'textarea[placeholder="Введите название заказа"]')), None))
+                self._set_editor(title, offer.title)
+
+            # 5. Срок
+            duration = self._select_duration(offer.days)
+        except (TimeoutException, WebDriverException) as e:
+            shot = self._screenshot(f'offer_{project_id}_fill_failed')
+            raise ParserError(f'Не удалось заполнить форму: {str(e).splitlines()[0][:200]}. Скриншот: {shot}')
+        except ParserError as e:
+            shot = self._screenshot(f'offer_{project_id}_fill_failed')
+            raise ParserError(f'{e}. Скриншот: {shot}')
+
+        if errors := self._form_errors():
+            shot = self._screenshot(f'offer_{project_id}_invalid')
+            raise ParserError(f'Kwork показывает ошибки в форме: {"; ".join(errors[:3])}. Скриншот: {shot}')
+
+        if dry_run:
+            shot = self._screenshot(f'offer_{project_id}_dry_run')
+            return f'Форма заполнена без отправки (срок: {duration}). Скриншот: {shot}'
+
+        buttons = [b for b in self._visible('button') if b.is_enabled() and b.text.strip() == 'Предложить']
         if not buttons:
             shot = self._screenshot(f'offer_{project_id}_no_button')
-            raise ParserError(f'Кнопка отправки не найдена (скриншот: {shot})')
+            raise ParserError(f'Кнопка «Предложить» не найдена или неактивна (скриншот: {shot})')
         start_url = driver.current_url
+        driver.execute_script('arguments[0].scrollIntoView({block: "center"})', buttons[-1])
         driver.execute_script('arguments[0].click()', buttons[-1])
 
         try:
@@ -323,12 +454,12 @@ class KworkBrowser:
                              d.find_element(By.TAG_NAME, 'body').text, re.I)
             )
         except TimeoutException:
-            errors = [e.text.strip() for e in self._visible('[class*="error"]') if e.text.strip()]
+            errors = self._form_errors() or [e.text.strip() for e in self._visible('[class*="error"]') if e.text.strip()]
             shot = self._screenshot(f'offer_{project_id}_failed')
             raise ParserError('Kwork не подтвердил отправку. '
                               + (f'Ошибки формы: {"; ".join(errors[:3])}. ' if errors else '')
                               + f'Скриншот: {shot}')
-        return driver.current_url
+        return f'срок: {duration}'
 
 
 class Monitor:
@@ -519,6 +650,21 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     if '--login' in sys.argv:
         _manual_login()
+    elif '--dry-run-offer' in sys.argv:
+        # python parser.py --dry-run-offer <project_id> [файл с текстом отклика]
+        # Заполняет форму отклика и сохраняет скриншот в logs/, НЕ нажимая «Предложить».
+        from offer import parse_offer
+        args = sys.argv[sys.argv.index('--dry-run-offer') + 1:]
+        pid = int(args[0])
+        raw = Path(args[1]).read_text(encoding='utf-8') if len(args) > 1 else (
+            'Здравствуйте! Это тестовое заполнение формы отклика, отправка не выполняется. ' * 3)
+        b = KworkBrowser()
+        try:
+            projects, _ = b.fetch_page(1)
+            project = next((p for p in projects if p['id'] == pid), {'id': pid, 'title': 'Тестовый заказ', 'price': ''})
+            print(b.send_offer(pid, parse_offer(raw, project), dry_run=True))
+        finally:
+            b.close()
     else:
         b = KworkBrowser()
         try:
