@@ -25,14 +25,16 @@ async def init_db() -> None:
                             CHECK (status IN ('new', 'sent', 'ignored', 'responded')),
                 message_ids TEXT,
                 draft       TEXT,
+                price_threshold INTEGER,
                 created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Миграция баз, созданных до появления AI-черновиков
+        # Миграция баз, созданных до появления этих колонок
         async with db.execute('PRAGMA table_info(projects)') as cur:
             columns = {row[1] async for row in cur}
-        if 'draft' not in columns:
-            await db.execute('ALTER TABLE projects ADD COLUMN draft TEXT')
+        for column, sql_type in (('draft', 'TEXT'), ('price_threshold', 'INTEGER')):
+            if column not in columns:
+                await db.execute(f'ALTER TABLE projects ADD COLUMN {column} {sql_type}')
         await db.commit()
 
 
@@ -52,8 +54,9 @@ async def add_project(project: dict) -> None:
     """Сохраняет проект со статусом new (если его ещё нет)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            '''INSERT OR IGNORE INTO projects (id, title, description, price, url, files_json, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            '''INSERT OR IGNORE INTO projects (id, title, description, price, url, files_json, status,
+                                               price_threshold)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
             (
                 project['id'],
                 project['title'],
@@ -62,6 +65,7 @@ async def add_project(project: dict) -> None:
                 project['url'],
                 json.dumps(project['files'], ensure_ascii=False),
                 STATUS_NEW,
+                project.get('price_threshold'),
             ),
         )
         await db.commit()

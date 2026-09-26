@@ -12,8 +12,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardBut
 import config
 import database as db
 from ai_service import AIService, AIServiceError
-from keyboards import ai_preview_kb, cancel_kb, days_kb, price_kb
-from offer import (PAYMENT_STAGES, OfferError, default_price, duration_label, max_price, param_lines, parse_offer,
+from keyboards import ai_preview_kb, cancel_kb, days_kb, price_kb, title_kb
+from offer import (PAYMENT_STAGES, TITLE_MAX, OfferError, default_price, duration_label, max_price, param_lines, parse_offer,
                    set_param)
 from parser import Monitor, ParserError
 from states import RespondState
@@ -21,7 +21,9 @@ from states import RespondState
 logger = logging.getLogger(__name__)
 
 router = Router()
-_submitting: set[int] = set()  # проекты, отклик на которые отправляется прямо сейчас
+_submitting: set[int] = set()
+# Состояния ввода, открытые из предпросмотра: при /cancel возвращаем предпросмотру кнопки
+PREVIEW_INPUT_STATES = (RespondState.editing_ai_draft, RespondState.editing_price, RespondState.editing_title)  # проекты, отклик на которые отправляется прямо сейчас
 # Ботом могут пользоваться только админы из config.LIST_ADMINS_ID
 router.message.filter(F.from_user.id.in_(config.LIST_ADMINS_ID))
 router.callback_query.filter(F.from_user.id.in_(config.LIST_ADMINS_ID))
@@ -131,7 +133,7 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext):
 
 @router.message(Command('cancel'), StateFilter('*'))
 async def cmd_cancel(message: Message, state: FSMContext, bot: Bot):
-    if await state.get_state() in (RespondState.editing_ai_draft, RespondState.editing_price):
+    if await state.get_state() in PREVIEW_INPUT_STATES:
         # Правка отменена — возвращаем кнопки прежнему предпросмотру
         data = await state.get_data()
         try:
@@ -378,8 +380,8 @@ async def _delete_prompt(bot: Bot, chat_id: int, data: dict) -> None:
 
 
 async def _apply_param(bot: Bot, chat_id: int, preview_message_id: int, project_id: int,
-                       name: str, value: int) -> None:
-    """Записывает «Цена: N» / «Срок: N» в черновик и обновляет предпросмотр на месте."""
+                       name: str, value: int | str | None) -> None:
+    """Записывает «Цена:» / «Срок:» / «Название:» в черновик (None — убрать) и обновляет предпросмотр на месте."""
     project = await db.get_project(project_id)
     draft = set_param(project['draft'], name, value)
     await db.set_draft(project_id, draft)
@@ -482,10 +484,67 @@ async def cb_ai_setdays(callback: CallbackQuery, bot: Bot):
     await callback.answer(f'Срок: {duration_label(days)}')
 
 
+@router.callback_query(F.data.startswith('title_ai_'))
+async def cb_ai_title(callback: CallbackQuery, state: FSMContext):
+    project_id = int(callback.data.removeprefix('title_ai_'))
+    project = await _get_draft_project(callback, project_id)
+    if project is None:
+        return
+    offer = parse_offer(project['draft'], project, validate=False)
+    if offer.payment == PAYMENT_STAGES:
+        await callback.answer('При оплате частями Kwork не спрашивает название заказа — только названия задач '
+                              'в строках «Задача: …».', show_alert=True)
+        return
+
+    await callback.message.edit_reply_markup(reply_markup=title_kb(project_id))
+    prompt = await callback.message.answer(
+        f'📝 Сейчас: «{html.escape(offer.title)}».\n'
+        f'Отправьте новое название заказа одной строкой (до {TITLE_MAX} символов) '
+        'или нажмите «↩️ Как в проекте». /cancel — отмена.'
+    )
+    await state.set_state(RespondState.editing_title)
+    await state.update_data(project_id=project_id, preview_message_id=callback.message.message_id,
+                            prompt_message_id=prompt.message_id)
+    await callback.answer()
+
+
+@router.message(RespondState.editing_title, F.text)
+async def title_text(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    title = ' '.join(message.text.split())
+    if len(title) > TITLE_MAX:
+        await message.answer(f'Слишком длинно: {len(title)} символов, Kwork допускает до {TITLE_MAX}. '
+                             'Сократите и отправьте ещё раз.')
+        return
+    if not title:
+        await message.answer('Название пустое — отправьте текст или /cancel.')
+        return
+
+    await state.clear()
+    await _apply_param(bot, message.chat.id, data['preview_message_id'], data['project_id'], 'Название', title)
+    await _delete_prompt(bot, message.chat.id, data)
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data.startswith('resettitle_ai_'))
+async def cb_ai_resettitle(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    project_id = int(callback.data.removeprefix('resettitle_ai_'))
+    if await _get_draft_project(callback, project_id) is None:
+        return
+    data = await state.get_data()
+    await state.clear()
+    await _apply_param(bot, callback.message.chat.id, callback.message.message_id, project_id, 'Название', None)
+    await _delete_prompt(bot, callback.message.chat.id, data)
+    await callback.answer('Название как в проекте')
+
+
 @router.callback_query(F.data.startswith('back_ai_'))
 async def cb_ai_back(callback: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
-    if await state.get_state() == RespondState.editing_price:
+    if await state.get_state() in (RespondState.editing_price, RespondState.editing_title):
         await state.clear()
         await _delete_prompt(bot, callback.message.chat.id, data)
     await callback.message.edit_reply_markup(
@@ -501,3 +560,8 @@ async def respond_not_text(message: Message):
 @router.message(RespondState.editing_price)
 async def price_not_text(message: Message):
     await message.answer('Нужна цена числом, например <code>5000</code>. Или /cancel.')
+
+
+@router.message(RespondState.editing_title)
+async def title_not_text(message: Message):
+    await message.answer('Нужно название заказа текстом. Или /cancel.')

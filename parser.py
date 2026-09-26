@@ -117,6 +117,8 @@ def _normalize(want: dict) -> dict:
         'description': html.unescape(want.get('description') or '').replace('\r\n', '\n').strip(),
         'price': price,
         'url': config.PROJECT_URL.format(project_id=project_id),
+        # С этой цены отклика Kwork предлагает выбрать порядок оплаты (целиком / частями)
+        'price_threshold': int(want.get('getPriceThreshold') or 0) or None,
         'files': [
             {'name': html.unescape(f.get('fname') or 'file'), 'url': f['url'], 'size': int(f.get('size') or 0)}
             for f in want.get('files') or []
@@ -371,6 +373,30 @@ class KworkBrowser:
                 self.driver.execute_script('arguments[0].click()', delete[0])
                 self._pause()
 
+    def _title_field(self) -> WebElement | None:
+        """Textarea «Название заказа», если её редактор сейчас виден (сама textarea всегда скрыта)."""
+        for textarea in self.driver.find_elements(By.CSS_SELECTOR, 'textarea[placeholder="Введите название заказа"]'):
+            boxes = textarea.find_elements(By.XPATH, './ancestor::div[contains(@class, "trumbowyg-box")][1]')
+            if boxes and boxes[0].is_displayed():
+                return textarea
+        return None
+
+    def _wait_payment_or_title(self) -> list[WebElement]:
+        """После ввода цены ждёт блок порядка оплаты или сразу поле названия. [] — выбора оплаты нет."""
+        def probe(d):
+            items = [e for e in d.find_elements(By.CSS_SELECTOR, '.offer-payment-type__item') if e.is_displayed()]
+            if items:
+                return 'payment', items
+            if self._title_field():
+                return 'title', []
+            return None
+        try:
+            WebDriverWait(self.driver, 10).until(probe)
+        except TimeoutException:
+            raise ParserError('После ввода цены не появился ни выбор оплаты, ни поле названия заказа')
+        time.sleep(0.5)  # форма перерисовывается после ввода цены — перепроверяем уже устоявшееся состояние
+        return (probe(self.driver) or ('title', []))[1]
+
     def _form_errors(self) -> list[str]:
         return [e.text.strip() for e in self._visible('.form-item__error, [class*="error-text"], .kw-error')
                 if e.text.strip()]
@@ -404,26 +430,34 @@ class KworkBrowser:
                     raise ParserError(f'Цена {offer.price} ₽ вне допустимого диапазона {low}–{high} ₽')
             self._type_number(price_input, offer.price)
 
-            # 3. Порядок оплаты
-            self._wait_visible('.offer-payment-type__item')
-            items = driver.find_elements(By.CSS_SELECTOR, '.offer-payment-type__item')
-            item = items[1 if offer.payment == PAYMENT_STAGES else 0]
-            driver.execute_script('arguments[0].scrollIntoView({block: "center"})', item)
-            item.click()
-            WebDriverWait(driver, 5).until(lambda d: 'active' in (item.get_attribute('class') or ''))
-            self._pause()
+            # 3. Порядок оплаты. Kwork показывает выбор только с определённой цены отклика
+            #    (getPriceThreshold проекта, обычно 4000 ₽), иначе сразу поле названия
+            payment, notes = offer.payment, []
+            if items := self._wait_payment_or_title():
+                item = items[1 if payment == PAYMENT_STAGES else 0]
+                driver.execute_script('arguments[0].scrollIntoView({block: "center"})', item)
+                item.click()
+                WebDriverWait(driver, 5).until(lambda d: 'active' in (item.get_attribute('class') or ''))
+                self._pause()
+            else:
+                if payment == PAYMENT_STAGES:
+                    if offer.payment_explicit:
+                        raise ParserError(f'Kwork не предлагает оплату частями при цене {offer.price} ₽ '
+                                          '(выбор появляется только с более высокой цены)')
+                    payment = PAYMENT_FULL
+                notes.append('выбора оплаты не было')
 
             # 4. Название заказа (целиком) или задачи (по частям)
-            if offer.payment == PAYMENT_STAGES:
+            if payment == PAYMENT_STAGES:
                 self._wait_visible('.stages__stage')
                 self._fill_stages(offer.stages)
             else:
-                title = WebDriverWait(driver, 10).until(lambda d: next(iter(
-                    d.find_elements(By.CSS_SELECTOR, 'textarea[placeholder="Введите название заказа"]')), None))
+                title = WebDriverWait(driver, 10).until(lambda d: self._title_field())
                 self._set_editor(title, offer.title)
 
             # 5. Срок
             duration = self._select_duration(offer.days)
+            notes.insert(0, f'срок: {duration}')
         except (TimeoutException, WebDriverException) as e:
             shot = self._screenshot(f'offer_{project_id}_fill_failed')
             raise ParserError(f'Не удалось заполнить форму: {str(e).splitlines()[0][:200]}. Скриншот: {shot}')
@@ -437,7 +471,7 @@ class KworkBrowser:
 
         if dry_run:
             shot = self._screenshot(f'offer_{project_id}_dry_run')
-            return f'Форма заполнена без отправки (срок: {duration}). Скриншот: {shot}'
+            return f'Форма заполнена без отправки ({", ".join(notes)}). Скриншот: {shot}'
 
         buttons = [b for b in self._visible('button') if b.is_enabled() and b.text.strip() == 'Предложить']
         if not buttons:
@@ -459,7 +493,7 @@ class KworkBrowser:
             raise ParserError('Kwork не подтвердил отправку. '
                               + (f'Ошибки формы: {"; ".join(errors[:3])}. ' if errors else '')
                               + f'Скриншот: {shot}')
-        return f'срок: {duration}'
+        return ', '.join(notes)
 
 
 class Monitor:
