@@ -177,10 +177,22 @@ async def _submit_offer(project: dict, raw_text: str, status_msg: Message, monit
     await db.set_status(project_id, db.STATUS_RESPONDED)
     await db.set_draft(project_id, None)
     await status_msg.edit_text(
-        f'✅ Отклик на «{html.escape(project["title"])}» отправлен ({html.escape(result)})\n\n'
-        + offer.summary_html()
+        f'✅ Отклик на «<a href="{html.escape(project["url"])}">{html.escape(project["title"])}</a>» '
+        f'отправлен ({html.escape(result)})\n\n' + offer.summary_html(),
+        disable_web_page_preview=True,
     )
+    # Карточка проекта (вместе с файлами) больше не нужна — убираем её из чата
+    message_ids = set(project.get('message_ids') or [])
     if source_message_id:
+        message_ids.add(source_message_id)
+    if not message_ids:
+        return True
+    try:
+        await bot.delete_messages(status_msg.chat.id, sorted(message_ids))
+    except TelegramBadRequest:
+        # Сообщения старше 48 часов удалить нельзя — просто меняем кнопки карточки
+        if not source_message_id:
+            return True
         try:
             await bot.edit_message_reply_markup(
                 chat_id=status_msg.chat.id,

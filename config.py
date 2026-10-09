@@ -48,6 +48,8 @@ FREELANCER_PROFILE = os.getenv('FREELANCER_PROFILE', '').replace('\\n', '\n')
 # Постоянный профиль Chrome: в нём хранятся cookies авторизованной сессии.
 CHROME_PROFILE_DIR = os.getenv('CHROME_PROFILE_DIR', str(BASE_DIR / 'chrome_profile'))
 HEADLESS = _bool('HEADLESS', False)
+# Обычное (не headless) окно сворачивается сразу после запуска и не мешает работе
+BROWSER_BACKGROUND = _bool('BROWSER_BACKGROUND', True)
 # Мажорная версия установленного Chrome (если uc скачивает несовместимый chromedriver)
 CHROME_VERSION_MAIN = _int('CHROME_VERSION_MAIN', 0) or None
 

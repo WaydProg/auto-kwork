@@ -31,7 +31,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 import config
 import database as db
 from keyboards import project_kb
-from offer import PAYMENT_STAGES, Offer
+from offer import PAYMENT_FULL, PAYMENT_STAGES, Offer
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,13 @@ if (ed) {
 ta.value = value;
 ta.dispatchEvent(new Event('input', {bubbles: true}));
 ta.dispatchEvent(new Event('change', {bubbles: true}));
+'''
+
+# В свёрнутом окне обычный клик до страницы не доходит — повторяем его событиями мыши.
+_CLICK_JS = '''
+for (const type of ['mousedown', 'mouseup', 'click']) {
+    arguments[0].dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+}
 '''
 
 
@@ -145,6 +152,22 @@ def _detect_chrome_major() -> int | None:
     return None
 
 
+def _ascii_prefs(path: Path) -> None:
+    """Переписывает Preferences профиля в чистый ASCII (\\uXXXX).
+
+    uc при каждом старте читает этот файл как latin1 и сохраняет обратно, поэтому кириллица
+    (например, имя профиля «Ваш Chrome») с каждым запуском удваивается. Файл дорастает до
+    гигабайтов, и Chrome падает на старте: `session not created: cannot connect to chrome`.
+    """
+    try:
+        raw = path.read_bytes()
+        if raw.isascii():
+            return
+        path.write_text(json.dumps(json.loads(raw)), encoding='ascii')
+    except (OSError, ValueError) as e:
+        logger.warning('Не удалось подготовить Preferences профиля Chrome: %s', e)
+
+
 def _user_id(driver) -> int:
     try:
         return int(driver.execute_script('return window.USER_ID || 0') or 0)
@@ -155,8 +178,9 @@ def _user_id(driver) -> int:
 class KworkBrowser:
     """Синхронная обёртка над Chrome. Методы вызывать только из потока executor'а."""
 
-    def __init__(self, headless: bool = config.HEADLESS):
+    def __init__(self, headless: bool = config.HEADLESS, background: bool = config.BROWSER_BACKGROUND):
         self.headless = headless
+        self.background = background and not headless
         self.driver: uc.Chrome | None = None
 
     # ---------- жизненный цикл ----------
@@ -171,12 +195,17 @@ class KworkBrowser:
                 self.close()
 
         Path(config.CHROME_PROFILE_DIR).mkdir(parents=True, exist_ok=True)
+        _ascii_prefs(Path(config.CHROME_PROFILE_DIR) / 'Default' / 'Preferences')
         for attempt in range(3):
             options = uc.ChromeOptions()  # uc не разрешает переиспользовать объект опций
             options.add_argument('--lang=ru-RU')
             options.add_argument('--window-size=1400,1000')
             options.add_argument('--no-first-run')
             options.add_argument('--no-default-browser-check')
+            # Свёрнутое окно Chrome иначе «усыпляет»: таймеры и отрисовка замедляются
+            options.add_argument('--disable-background-timer-throttling')
+            options.add_argument('--disable-backgrounding-occluded-windows')
+            options.add_argument('--disable-renderer-backgrounding')
             try:
                 self.driver = uc.Chrome(
                     options=options,
@@ -192,6 +221,11 @@ class KworkBrowser:
                 logger.warning('Не удалось запустить chromedriver (%s), повтор...', e)
                 time.sleep(3)
         self.driver.set_page_load_timeout(config.PAGE_LOAD_TIMEOUT)
+        if self.background:
+            try:
+                self.driver.minimize_window()
+            except WebDriverException:
+                logger.warning('Не удалось свернуть окно браузера')
         return self.driver
 
     def close(self) -> None:
@@ -319,12 +353,38 @@ class KworkBrowser:
     def _pause(self) -> None:
         time.sleep(random.uniform(0.4, 1.0))
 
+    def _click(self, element: WebElement, done, timeout: float = 5) -> None:
+        """Кликает и ждёт done(driver). Если обычный клик не сработал (свёрнутое окно), кликает через JS."""
+        try:
+            element.click()
+            WebDriverWait(self.driver, 1.5).until(done)
+            return
+        except WebDriverException:  # в т.ч. TimeoutException
+            pass
+        self.driver.execute_script(_CLICK_JS, element)
+        WebDriverWait(self.driver, timeout).until(done)
+
     def _type_number(self, inp: WebElement, value: int) -> None:
-        """Цены вводятся посимвольно: от этого поля зависят блоки, которые форма показывает дальше."""
+        """Цены вводятся посимвольно: от этого поля зависят блоки, которые форма показывает дальше.
+
+        send_keys в свёрнутом окне (BROWSER_BACKGROUND) до поля не доходит, поэтому символы
+        вставляются через CDP в сфокусированное поле, а результат сверяется со значением поля.
+        """
+        def typed() -> str:
+            return re.sub(r'\D', '', inp.get_attribute('value') or '')
+
         self.driver.execute_script('arguments[0].scrollIntoView({block: "center"})', inp)
-        self.driver.execute_script(_SET_VALUE_JS, inp, '')
+        if inp.get_attribute('value'):
+            self.driver.execute_script(_SET_VALUE_JS, inp, '')
         self.driver.execute_script('arguments[0].focus()', inp)
-        inp.send_keys(str(value))
+        if self.driver.execute_script('return document.activeElement === arguments[0]', inp):
+            for char in str(value):
+                self.driver.execute_cdp_cmd('Input.insertText', {'text': char})
+                time.sleep(random.uniform(0.05, 0.15))
+        if typed() != str(value):
+            self.driver.execute_script(_SET_VALUE_JS, inp, str(value))
+        if typed() != str(value):
+            raise ParserError(f'Не удалось ввести цену {value} ₽: в поле осталось «{inp.get_attribute("value")}»')
         self._pause()
 
     def _set_editor(self, textarea: WebElement, value: str) -> None:
@@ -337,8 +397,8 @@ class KworkBrowser:
         """Выбирает в списке срока ближайший вариант, не меньший days. Возвращает подпись варианта."""
         root = self._wait_visible('.v-select.duration-select')
         self.driver.execute_script('arguments[0].scrollIntoView({block: "center"})', root)
-        root.find_element(By.CSS_SELECTOR, '.vs__dropdown-toggle').click()
-        WebDriverWait(self.driver, 5).until(lambda d: d.find_elements(By.CSS_SELECTOR, '.vs__dropdown-option'))
+        self._click(root.find_element(By.CSS_SELECTOR, '.vs__dropdown-toggle'),
+                    lambda d: d.find_elements(By.CSS_SELECTOR, '.vs__dropdown-option'))
         # .text пуст у пунктов вне видимой области меню, поэтому читаем textContent
         options = [(o, _duration_days(o.get_attribute('textContent')))
                    for o in self.driver.find_elements(By.CSS_SELECTOR, '.vs__dropdown-option')]
@@ -348,7 +408,7 @@ class KworkBrowser:
         option, _ = min(((o, n) for o, n in options if n >= days), key=lambda x: x[1], default=max(options, key=lambda x: x[1]))
         label = option.get_attribute('textContent').strip()
         self.driver.execute_script('arguments[0].scrollIntoView({block: "nearest"})', option)
-        option.click()
+        self._click(option, lambda d: 'vs--open' not in (root.get_attribute('class') or ''))
         self._pause()
         return label
 
@@ -436,8 +496,7 @@ class KworkBrowser:
             if items := self._wait_payment_or_title():
                 item = items[1 if payment == PAYMENT_STAGES else 0]
                 driver.execute_script('arguments[0].scrollIntoView({block: "center"})', item)
-                item.click()
-                WebDriverWait(driver, 5).until(lambda d: 'active' in (item.get_attribute('class') or ''))
+                self._click(item, lambda d: 'active' in (item.get_attribute('class') or ''))
                 self._pause()
             else:
                 if payment == PAYMENT_STAGES:
@@ -671,7 +730,7 @@ class Monitor:
 
 def _manual_login() -> None:
     """Открывает Chrome с профилем бота, чтобы войти в Kwork вручную (например, при капче)."""
-    browser = KworkBrowser(headless=False)
+    browser = KworkBrowser(headless=False, background=False)
     try:
         browser._ensure_driver().get('https://kwork.ru/login')
         input('Войдите в аккаунт Kwork в открывшемся окне и нажмите Enter здесь...')
